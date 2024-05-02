@@ -24,7 +24,7 @@
 
   <groupId>io.atomix</groupId>
   <artifactId>atomix-parent</artifactId>
-  <version>3.1.9</version>
+  <version>3.3.0</version>
   <packaging>pom</packaging>
   <name>Atomix Parent Pom</name>
   <description>Distributed systems framework.</description>
@@ -50,7 +50,7 @@
 
     <!-- Core dependencies -->
     <guava.version>22.0</guava.version>
-    <kryo.version>4.0.2</kryo.version>
+    <kryo.version>5.6.0</kryo.version>
     <commons.lang3.version>3.7</commons.lang3.version>
     <commons.math3.version>3.6.1</commons.math3.version>
     <netty.version>4.1.27.Final</netty.version>

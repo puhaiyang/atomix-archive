@@ -67,9 +67,8 @@ public class DefaultDocumentTreeService extends AbstractPrimitiveService<Documen
           kryo.writeObject(output, object.root);
         }
 
-        @Override
         @SuppressWarnings("unchecked")
-        public DefaultAtomicDocumentTree read(Kryo kryo, Input input, Class<DefaultAtomicDocumentTree> type) {
+        public io.atomix.core.tree.impl.DefaultAtomicDocumentTree read(Kryo kryo, Input input, Class<? extends io.atomix.core.tree.impl.DefaultAtomicDocumentTree> type) {
           return new DefaultAtomicDocumentTree(versionCounter::incrementAndGet,
               kryo.readObject(input, DefaultDocumentTreeNode.class));
         }

@@ -18,12 +18,14 @@ package io.atomix.utils.serializer;
 import com.esotericsoftware.kryo.Kryo;
 import com.esotericsoftware.kryo.Registration;
 import com.esotericsoftware.kryo.Serializer;
+import com.esotericsoftware.kryo.SerializerFactory;
 import com.esotericsoftware.kryo.io.ByteBufferInput;
 import com.esotericsoftware.kryo.io.ByteBufferOutput;
-import com.esotericsoftware.kryo.pool.KryoCallback;
-import com.esotericsoftware.kryo.pool.KryoFactory;
-import com.esotericsoftware.kryo.pool.KryoPool;
+import com.esotericsoftware.kryo.io.Input;
+import com.esotericsoftware.kryo.io.Output;
 import com.esotericsoftware.kryo.serializers.CompatibleFieldSerializer;
+import com.esotericsoftware.kryo.util.DefaultInstantiatorStrategy;
+import com.esotericsoftware.kryo.util.Pool;
 import com.google.common.base.MoreObjects;
 import com.google.common.collect.ImmutableList;
 import io.atomix.utils.config.ConfigurationException;
@@ -48,7 +50,7 @@ import static org.slf4j.LoggerFactory.getLogger;
  * Pool of Kryo instances, with classes pre-registered.
  */
 //@ThreadSafe
-public final class Namespace implements KryoFactory, KryoPool {
+public final class Namespace {
 
   /**
    * Default buffer size used for serialization.
@@ -81,13 +83,23 @@ public final class Namespace implements KryoFactory, KryoPool {
    */
   public static final Namespace DEFAULT = builder().build();
 
-  private final KryoPool kryoPool = new KryoPool.Builder(this)
-      .softReferences()
-      .build();
+  private final Pool<Kryo> kryoPool = new Pool<Kryo>(true, true, 16) {
+    protected Kryo create() {
+      return Namespace.this.create();
+    }
+  };
 
-  private final KryoOutputPool kryoOutputPool = new KryoOutputPool();
-  private final KryoInputPool kryoInputPool = new KryoInputPool();
+  private final Pool<Output> kryoOutputPool = new Pool<Output>(true, true, 16) {
+    protected Output create() {
+      return new Output(1024, -1);
+    }
+  };
 
+  private final Pool<Input> kryoInputPool = new Pool<Input>(true, true, 16) {
+    protected Input create() {
+      return new Input(1024);
+    }
+  };
   private final ImmutableList<RegistrationBlock> registeredBlocks;
 
   private final ClassLoader classLoader;
@@ -342,13 +354,20 @@ public final class Namespace implements KryoFactory, KryoPool {
    * @return serialized bytes
    */
   public byte[] serialize(final Object obj, final int bufferSize) {
-    return kryoOutputPool.run(output -> {
-      return kryoPool.run(kryo -> {
-        kryo.writeClassAndObject(output, obj);
-        output.flush();
-        return output.getByteArrayOutputStream().toByteArray();
-      });
-    }, bufferSize);
+    Output output = kryoOutputPool.obtain();
+    Kryo kryo = kryoPool.obtain();
+    try {
+      kryo.writeClassAndObject(output, obj);
+      output.flush();
+      return output.toBytes();
+    } catch (Exception e) {
+      log.error("serialize err={}", e.getMessage());
+      e.printStackTrace();
+      throw e;
+    } finally {
+      kryoPool.free(kryo);
+      kryoOutputPool.free(output);
+    }
   }
 
   /**
@@ -404,14 +423,20 @@ public final class Namespace implements KryoFactory, KryoPool {
    * @return deserialized Object
    */
   public <T> T deserialize(final byte[] bytes) {
-    return kryoInputPool.run(input -> {
+    Input input = kryoInputPool.obtain();
+    Kryo kryo = kryoPool.obtain();
+    try {
       input.setInputStream(new ByteArrayInputStream(bytes));
-      return kryoPool.run(kryo -> {
-        @SuppressWarnings("unchecked")
-        T obj = (T) kryo.readClassAndObject(input);
-        return obj;
-      });
-    }, DEFAULT_BUFFER_SIZE);
+      T obj = (T) kryo.readClassAndObject(input);
+      return obj;
+    } catch (Exception e) {
+      log.error("deserialize err={},bytes={}", e.getMessage(), bytes);
+      e.printStackTrace();
+      throw e;
+    } finally {
+      kryoPool.free(kryo);
+      kryoInputPool.free(input);
+    }
   }
 
   /**
@@ -484,7 +509,6 @@ public final class Namespace implements KryoFactory, KryoPool {
    *
    * @return Kryo instance
    */
-  @Override
   public Kryo create() {
     log.trace("Creating Kryo instance for {}", this);
     Kryo kryo = new Kryo();
@@ -493,12 +517,11 @@ public final class Namespace implements KryoFactory, KryoPool {
 
     // If compatible serialization is enabled, override the default serializer.
     if (compatible) {
-      kryo.setDefaultSerializer(CompatibleFieldSerializer::new);
+      kryo.setDefaultSerializer(new SerializerFactory.CompatibleFieldSerializerFactory());
     }
 
     // TODO rethink whether we want to use StdInstantiatorStrategy
-    kryo.setInstantiatorStrategy(
-        new Kryo.DefaultInstantiatorStrategy(new StdInstantiatorStrategy()));
+    kryo.setInstantiatorStrategy(new DefaultInstantiatorStrategy(new StdInstantiatorStrategy()));
 
     for (RegistrationBlock block : registeredBlocks) {
       int id = block.begin();
@@ -521,61 +544,27 @@ public final class Namespace implements KryoFactory, KryoPool {
    * @param id         type registration id to use
    */
   private void register(Kryo kryo, Class<?>[] types, Serializer<?> serializer, int id) {
-    Registration existing = kryo.getRegistration(id);
-    if (existing != null) {
-      boolean matches = false;
-      for (Class<?> type : types) {
-        if (existing.getType() == type) {
-          matches = true;
-          break;
-        }
-      }
-
-      if (!matches) {
-        log.error("{}: Failed to register {} as {}, {} was already registered.",
-            friendlyName(), types, id, existing.getType());
-
-        throw new IllegalStateException(String.format(
-            "Failed to register %s as %s, %s was already registered.",
-            Arrays.toString(types), id, existing.getType()));
-      }
-      // falling through to register call for now.
-      // Consider skipping, if there's reasonable
-      // way to compare serializer equivalence.
-    }
-
     for (Class<?> type : types) {
       Registration r = null;
       if (serializer == null) {
-        r = kryo.register(type, id);
+        r = kryo.register(type);
       } else if (type.isInterface()) {
         kryo.addDefaultSerializer(type, serializer);
       } else {
-        r = kryo.register(type, serializer, id);
+        r = kryo.register(type, serializer);
       }
       if (r != null) {
-        if (r.getId() != id) {
-          log.debug("{}: {} already registered as {}. Skipping {}.",
-              friendlyName(), r.getType(), r.getId(), id);
-        }
         log.trace("{} registered as {}", r.getType(), r.getId());
       }
     }
   }
 
-  @Override
   public Kryo borrow() {
-    return kryoPool.borrow();
+    return kryoPool.obtain();
   }
 
-  @Override
   public void release(Kryo kryo) {
-    kryoPool.release(kryo);
-  }
-
-  @Override
-  public <T> T run(KryoCallback<T> callback) {
-    return kryoPool.run(callback);
+    kryoPool.free(kryo);
   }
 
   @Override
