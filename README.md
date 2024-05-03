@@ -1,6 +1,6 @@
 # [Atomix][Website]
 
-forked from atomix/atomix-archive,updated kryo to 5.6.0
+forked from atomix/atomix-archive,updated kryo to 5.6.0,netty to 4.1.109
 
 
 
